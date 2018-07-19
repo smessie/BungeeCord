@@ -61,6 +61,7 @@ import net.md_5.bungee.protocol.packet.SetCompression;
 import net.md_5.bungee.tab.ServerUnique;
 import net.md_5.bungee.tab.TabList;
 import net.md_5.bungee.util.CaseInsensitiveSet;
+import net.md_5.bungee.util.ChatComponentTransformer;
 
 @RequiredArgsConstructor
 public final class UserConnection implements ProxiedPlayer
@@ -89,9 +90,6 @@ public final class UserConnection implements ProxiedPlayer
     @Getter
     private final Collection<ServerInfo> pendingConnects = new HashSet<>();
     /*========================================================================*/
-    @Getter
-    @Setter
-    private long sentPingId;
     @Getter
     @Setter
     private long sentPingTime;
@@ -156,20 +154,6 @@ public final class UserConnection implements ProxiedPlayer
 
         this.displayName = name;
 
-        /*
-        switch ( getPendingConnection().getListener().getTabListType() )
-        {
-            case "GLOBAL":
-                tabListHandler = new Global( this );
-                break;
-            case "SERVER":
-                tabListHandler = new ServerUnique( this );
-                break;
-            default:
-                tabListHandler = new GlobalPing( this );
-                break;
-        }
-         */
         tabListHandler = new ServerUnique( this );
 
         Collection<String> g = bungee.getConfigurationAdapter().getGroups( name );
@@ -206,19 +190,37 @@ public final class UserConnection implements ProxiedPlayer
     @Override
     public void connect(ServerInfo target)
     {
-        connect( target, null );
+        connect( target, null, ServerConnectEvent.Reason.PLUGIN );
+    }
+
+    @Override
+    public void connect(ServerInfo target, ServerConnectEvent.Reason reason)
+    {
+        connect( target, null, false, reason );
     }
 
     @Override
     public void connect(ServerInfo target, Callback<Boolean> callback)
     {
-        connect( target, callback, false );
+        connect( target, callback, false, ServerConnectEvent.Reason.PLUGIN );
     }
 
+    @Override
+    public void connect(ServerInfo target, Callback<Boolean> callback, ServerConnectEvent.Reason reason)
+    {
+        connect( target, callback, false, reason );
+    }
+
+    @Deprecated
     public void connectNow(ServerInfo target)
     {
+        connectNow( target, ServerConnectEvent.Reason.UNKNOWN );
+    }
+
+    public void connectNow(ServerInfo target, ServerConnectEvent.Reason reason)
+    {
         dimensionChange = true;
-        connect( target );
+        connect( target, reason );
     }
 
     public ServerInfo updateAndGetNextServer(ServerInfo currentTarget)
@@ -244,9 +246,14 @@ public final class UserConnection implements ProxiedPlayer
 
     public void connect(ServerInfo info, final Callback<Boolean> callback, final boolean retry)
     {
+        connect( info, callback, retry, ServerConnectEvent.Reason.PLUGIN );
+    }
+
+    public void connect(ServerInfo info, final Callback<Boolean> callback, final boolean retry, ServerConnectEvent.Reason reason)
+    {
         Preconditions.checkNotNull( info, "info" );
 
-        ServerConnectEvent event = new ServerConnectEvent( this, info );
+        ServerConnectEvent event = new ServerConnectEvent( this, info, reason );
         if ( bungee.getPluginManager().callEvent( event ).isCancelled() )
         {
             if ( callback != null )
@@ -317,7 +324,7 @@ public final class UserConnection implements ProxiedPlayer
                     if ( retry && def != null && ( getServer() == null || def != getServer().getInfo() ) )
                     {
                         sendMessage( bungee.getTranslation( "fallback_lobby" ) );
-                        connect( def, null, true );
+                        connect( def, null, true, ServerConnectEvent.Reason.LOBBY_FALLBACK );
                     } else if ( dimensionChange )
                     {
                         disconnect( bungee.getTranslation( "fallback_kick", future.cause().getClass().getName() ) );
@@ -421,6 +428,9 @@ public final class UserConnection implements ProxiedPlayer
     @Override
     public void sendMessage(ChatMessageType position, BaseComponent... message)
     {
+        // transform score components
+        message = ChatComponentTransformer.getInstance().transform( this, message );
+
         // Action bar doesn't display the new JSON formattings, legacy works - send it using this for now
         if ( position == ChatMessageType.ACTION_BAR )
         {
@@ -434,6 +444,8 @@ public final class UserConnection implements ProxiedPlayer
     @Override
     public void sendMessage(ChatMessageType position, BaseComponent message)
     {
+        message = ChatComponentTransformer.getInstance().transform( this, message )[0];
+
         // Action bar doesn't display the new JSON formattings, legacy works - send it using this for now
         if ( position == ChatMessageType.ACTION_BAR )
         {
@@ -611,23 +623,27 @@ public final class UserConnection implements ProxiedPlayer
         return ImmutableMap.copyOf( forgeClientHandler.getClientModList() );
     }
 
-    private static final String EMPTY_TEXT = ComponentSerializer.toString( new TextComponent( "" ) );
-
     @Override
     public void setTabHeader(BaseComponent header, BaseComponent footer)
     {
+        header = ChatComponentTransformer.getInstance().transform( this, header )[0];
+        footer = ChatComponentTransformer.getInstance().transform( this, footer )[0];
+
         unsafe().sendPacket( new PlayerListHeaderFooter(
-                ( header != null ) ? ComponentSerializer.toString( header ) : EMPTY_TEXT,
-                ( footer != null ) ? ComponentSerializer.toString( footer ) : EMPTY_TEXT
+                ComponentSerializer.toString( header ),
+                ComponentSerializer.toString( footer )
         ) );
     }
 
     @Override
     public void setTabHeader(BaseComponent[] header, BaseComponent[] footer)
     {
+        header = ChatComponentTransformer.getInstance().transform( this, header );
+        footer = ChatComponentTransformer.getInstance().transform( this, footer );
+
         unsafe().sendPacket( new PlayerListHeaderFooter(
-                ( header != null ) ? ComponentSerializer.toString( header ) : EMPTY_TEXT,
-                ( footer != null ) ? ComponentSerializer.toString( footer ) : EMPTY_TEXT
+                ComponentSerializer.toString( header ),
+                ComponentSerializer.toString( footer )
         ) );
     }
 
@@ -663,5 +679,11 @@ public final class UserConnection implements ProxiedPlayer
     public boolean isConnected()
     {
         return !ch.isClosed();
+    }
+
+    @Override
+    public Scoreboard getScoreboard()
+    {
+        return serverSentScoreboard;
     }
 }

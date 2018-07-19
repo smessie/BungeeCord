@@ -6,11 +6,13 @@ import io.netty.buffer.ByteBufAllocator;
 import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
+import java.util.logging.Level;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import net.md_5.bungee.api.ChatColor;
 import net.md_5.bungee.api.ProxyServer;
 import net.md_5.bungee.api.config.ServerInfo;
+import net.md_5.bungee.api.event.ServerConnectEvent;
 import net.md_5.bungee.api.event.ServerConnectedEvent;
 import net.md_5.bungee.api.event.ServerKickEvent;
 import net.md_5.bungee.api.event.ServerSwitchEvent;
@@ -29,7 +31,9 @@ import net.md_5.bungee.netty.ChannelWrapper;
 import net.md_5.bungee.netty.HandlerBoss;
 import net.md_5.bungee.netty.PacketHandler;
 import net.md_5.bungee.protocol.DefinedPacket;
+import net.md_5.bungee.protocol.PacketWrapper;
 import net.md_5.bungee.protocol.Protocol;
+import net.md_5.bungee.protocol.ProtocolConstants;
 import net.md_5.bungee.protocol.packet.EncryptionRequest;
 import net.md_5.bungee.protocol.packet.Handshake;
 import net.md_5.bungee.protocol.packet.Kick;
@@ -41,6 +45,7 @@ import net.md_5.bungee.protocol.packet.Respawn;
 import net.md_5.bungee.protocol.packet.ScoreboardObjective;
 import net.md_5.bungee.protocol.packet.ScoreboardScore;
 import net.md_5.bungee.protocol.packet.SetCompression;
+import net.md_5.bungee.util.BufUtil;
 
 @RequiredArgsConstructor
 public class ServerConnector extends PacketHandler
@@ -100,7 +105,7 @@ public class ServerConnector extends PacketHandler
             copiedHandshake.setHost( newHost );
         } else if ( !user.getExtraDataInHandshake().isEmpty() )
         {
-            // Only restore the extra data if IP forwarding is off. 
+            // Only restore the extra data if IP forwarding is off.
             // TODO: Add support for this data with IP forwarding.
             copiedHandshake.setHost( copiedHandshake.getHost() + user.getExtraDataInHandshake() );
         }
@@ -115,6 +120,15 @@ public class ServerConnector extends PacketHandler
     public void disconnected(ChannelWrapper channel) throws Exception
     {
         user.getPendingConnects().remove( target );
+    }
+
+    @Override
+    public void handle(PacketWrapper packet) throws Exception
+    {
+        if ( packet.packet == null )
+        {
+            throw new IllegalArgumentException( "Unexpected packet received during server login process!\n" + BufUtil.dump( packet.buf, 64 ) );
+        }
     }
 
     @Override
@@ -161,7 +175,7 @@ public class ServerConnector extends PacketHandler
         ServerConnectedEvent event = new ServerConnectedEvent( user, server );
         bungee.getPluginManager().callEvent( event );
 
-        ch.write( BungeeCord.getInstance().registerChannels() );
+        ch.write( BungeeCord.getInstance().registerChannels( user.getPendingConnection().getVersion() ) );
         Queue<DefinedPacket> packetQueue = target.getPacketQueue();
         synchronized ( packetQueue )
         {
@@ -200,7 +214,7 @@ public class ServerConnector extends PacketHandler
 
             ByteBuf brand = ByteBufAllocator.DEFAULT.heapBuffer();
             DefinedPacket.writeString( bungee.getName() + " (" + bungee.getVersion() + ")", brand );
-            user.unsafe().sendPacket( new PluginMessage( "MC|Brand", DefinedPacket.toArray( brand ), handshakeHandler.isServerForge() ) );
+            user.unsafe().sendPacket( new PluginMessage( user.getPendingConnection().getVersion() >= ProtocolConstants.MINECRAFT_1_13 ? "minecraft:brand" : "MC|Brand", DefinedPacket.toArray( brand ), handshakeHandler.isServerForge() ) );
             brand.release();
 
             user.setDimension( login.getDimension() );
@@ -212,7 +226,7 @@ public class ServerConnector extends PacketHandler
             Scoreboard serverScoreboard = user.getServerSentScoreboard();
             for ( Objective objective : serverScoreboard.getObjectives() )
             {
-                user.unsafe().sendPacket( new ScoreboardObjective( objective.getName(), objective.getValue(), objective.getType(), (byte) 1 ) );
+                user.unsafe().sendPacket( new ScoreboardObjective( objective.getName(), objective.getValue(), ScoreboardObjective.HealthDisplay.fromString( objective.getType() ), (byte) 1 ) );
             }
             for ( Score score : serverScoreboard.getScores() )
             {
@@ -291,7 +305,7 @@ public class ServerConnector extends PacketHandler
         if ( event.isCancelled() && event.getCancelServer() != null )
         {
             obsolete = true;
-            user.connect( event.getCancelServer() );
+            user.connect( event.getCancelServer(), ServerConnectEvent.Reason.KICK_REDIRECT );
             throw CancelSendSignal.INSTANCE;
         }
 
@@ -310,47 +324,49 @@ public class ServerConnector extends PacketHandler
     @Override
     public void handle(PluginMessage pluginMessage) throws Exception
     {
-        if ( pluginMessage.getTag().equals( ForgeConstants.FML_REGISTER ) )
+        if ( BungeeCord.getInstance().config.isForgeSupport() )
         {
-            Set<String> channels = ForgeUtils.readRegisteredChannels( pluginMessage );
-            boolean isForgeServer = false;
-            for ( String channel : channels )
+            if ( pluginMessage.getTag().equals( ForgeConstants.FML_REGISTER ) )
             {
-                if ( channel.equals( ForgeConstants.FML_HANDSHAKE_TAG ) )
+                Set<String> channels = ForgeUtils.readRegisteredChannels( pluginMessage );
+                boolean isForgeServer = false;
+                for ( String channel : channels )
                 {
-                    // If we have a completed handshake and we have been asked to register a FML|HS
-                    // packet, let's send the reset packet now. Then, we can continue the message sending.
-                    // The handshake will not be complete if we reset this earlier.
-                    if ( user.getServer() != null && user.getForgeClientHandler().isHandshakeComplete() )
+                    if ( channel.equals( ForgeConstants.FML_HANDSHAKE_TAG ) )
                     {
-                        user.getForgeClientHandler().resetHandshake();
-                    }
+                        // If we have a completed handshake and we have been asked to register a FML|HS
+                        // packet, let's send the reset packet now. Then, we can continue the message sending.
+                        // The handshake will not be complete if we reset this earlier.
+                        if ( user.getServer() != null && user.getForgeClientHandler().isHandshakeComplete() )
+                        {
+                            user.getForgeClientHandler().resetHandshake();
+                        }
 
-                    isForgeServer = true;
-                    break;
+                        isForgeServer = true;
+                        break;
+                    }
+                }
+
+                if ( isForgeServer && !this.handshakeHandler.isServerForge() )
+                {
+                    // We now set the server-side handshake handler for the client to this.
+                    handshakeHandler.setServerAsForgeServer();
+                    user.setForgeServerHandler( handshakeHandler );
                 }
             }
 
-            if ( isForgeServer && !this.handshakeHandler.isServerForge() )
+            if ( pluginMessage.getTag().equals( ForgeConstants.FML_HANDSHAKE_TAG ) || pluginMessage.getTag().equals( ForgeConstants.FORGE_REGISTER ) )
             {
-                // We now set the server-side handshake handler for the client to this.
-                handshakeHandler.setServerAsForgeServer();
-                user.setForgeServerHandler( handshakeHandler );
+                this.handshakeHandler.handle( pluginMessage );
+
+                // We send the message as part of the handler, so don't send it here.
+                throw CancelSendSignal.INSTANCE;
             }
         }
 
-        if ( pluginMessage.getTag().equals( ForgeConstants.FML_HANDSHAKE_TAG ) || pluginMessage.getTag().equals( ForgeConstants.FORGE_REGISTER ) )
-        {
-            this.handshakeHandler.handle( pluginMessage );
-
-            // We send the message as part of the handler, so don't send it here.
-            throw CancelSendSignal.INSTANCE;
-        } else
-        {
-            // We have to forward these to the user, especially with Forge as stuff might break
-            // This includes any REGISTER messages we intercepted earlier.
-            user.unsafe().sendPacket( pluginMessage );
-        }
+        // We have to forward these to the user, especially with Forge as stuff might break
+        // This includes any REGISTER messages we intercepted earlier.
+        user.unsafe().sendPacket( pluginMessage );
     }
 
     @Override
