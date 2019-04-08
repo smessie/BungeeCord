@@ -1,7 +1,6 @@
 package net.md_5.bungee;
 
 import com.google.common.base.Charsets;
-import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicate;
 import com.google.common.collect.Iterables;
@@ -282,7 +281,7 @@ public class BungeeCord extends ProxyServer
 
         if ( config.getThrottle() > 0 )
         {
-            connectionThrottle = new ConnectionThrottle( config.getThrottle() );
+            connectionThrottle = new ConnectionThrottle( config.getThrottle(), config.getThrottleLimit() );
         }
         startListeners();
 
@@ -307,6 +306,12 @@ public class BungeeCord extends ProxyServer
             if ( info.isProxyProtocol() )
             {
                 getLogger().log( Level.WARNING, "Using PROXY protocol for listener {0}, please ensure this listener is adequately firewalled.", info.getHost() );
+
+                if ( connectionThrottle != null )
+                {
+                    connectionThrottle = null;
+                    getLogger().log( Level.WARNING, "Since PROXY protocol is in use, internal connection throttle has been disabled." );
+                }
             }
 
             ChannelFutureListener listener = new ChannelFutureListener()
@@ -724,7 +729,7 @@ public class BungeeCord extends ProxyServer
             @Override
             public boolean apply(ProxiedPlayer input)
             {
-                return ( input == null ) ? false : input.getName().toLowerCase().startsWith( partialName.toLowerCase() );
+                return ( input == null ) ? false : input.getName().toLowerCase( Locale.ROOT ).startsWith( partialName.toLowerCase( Locale.ROOT ) );
             }
         } ) );
     }
